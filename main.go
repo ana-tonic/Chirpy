@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ type apiConfig struct {
 	db             *database.Queries
 	tokenSecret    string
 	platform       string
+	polkaKey       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -40,17 +42,18 @@ type userRequest struct {
 }
 
 type loginRequest struct {
-	Email            string `json:"email"`
-	Password         string `json:"password"`
-	ExpiresInSeconds int    `json:"expires_in_seconds"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 type userResponse struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	Token     string    `json:"token"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 type chirpRequest struct {
@@ -64,6 +67,17 @@ type chirpResponse struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Body      string    `json:"body"`
 	UserID    uuid.UUID `json:"user_id"`
+}
+
+type refreshResponse struct {
+	Token string `json:"token"`
+}
+
+type polkaWebhookRequest struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserID uuid.UUID `json:"user_id"`
+	} `json:"data"`
 }
 
 func main() {
@@ -85,7 +99,9 @@ func main() {
 
 	tokenSecret := os.Getenv("TOKEN_SECRET")
 	apiConfig.tokenSecret = tokenSecret
-	log.Printf("Token secret loaded: %q", tokenSecret)
+
+	polkaKey := os.Getenv("POLKA_KEY")
+	apiConfig.polkaKey = polkaKey
 
 	h1 := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -248,12 +264,38 @@ func main() {
 	}
 
 	getChirpsHandler := func(w http.ResponseWriter, r *http.Request) {
-		chirps, err := apiConfig.db.GetChirps(r.Context())
+		authorID := r.URL.Query().Get("author_id")
+		var chirps []database.Chirp
+		var err error
+
+		if authorID != "" {
+			authorIDUUID, err := uuid.Parse(authorID)
+			if err != nil {
+				log.Printf("Error parsing author ID: %s", err)
+				w.WriteHeader(400)
+				w.Write([]byte("Invalid author ID"))
+				return
+			}
+			chirps, err = apiConfig.db.GetChirpsByAuthorID(r.Context(), authorIDUUID)
+		} else {
+			chirps, err = apiConfig.db.GetChirps(r.Context())
+		}
+
 		if err != nil {
 			log.Printf("Error getting chirps: %s", err)
 			w.WriteHeader(500)
 			w.Write([]byte("Something went wrong"))
 			return
+		}
+
+		sortOrder := r.URL.Query().Get("sort")
+		if sortOrder == "desc" {
+			slices.SortFunc(chirps, func(i, j database.Chirp) int {
+				if i.CreatedAt.After(j.CreatedAt) {
+					return -1
+				}
+				return 1
+			})
 		}
 
 		respBody := []chirpResponse{}
@@ -266,6 +308,7 @@ func main() {
 				UserID:    chirp.UserID,
 			})
 		}
+
 		dat, err := json.Marshal(respBody)
 		if err != nil {
 			log.Printf("Error marshalling JSON: %s", err)
@@ -343,15 +386,90 @@ func main() {
 		// Default expiration time is 1 hour
 		expiresIn := time.Hour
 
-		// If client specified expiration time, use it (but cap at 1 hour)
-		if params.ExpiresInSeconds > 0 {
-			clientExpiration := time.Duration(params.ExpiresInSeconds) * time.Second
-			if clientExpiration < expiresIn {
-				expiresIn = clientExpiration
-			}
+		token, err := auth.MakeJWT(user.ID, apiConfig.tokenSecret, expiresIn)
+		if err != nil {
+			log.Printf("Error creating JWT: %s", err)
+			w.WriteHeader(500)
+			return
 		}
 
-		token, err := auth.MakeJWT(user.ID, apiConfig.tokenSecret, expiresIn)
+		refreshToken, err := auth.MakeRefreshToken()
+		if err != nil {
+			log.Printf("Error creating refresh token: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+
+		_, err = apiConfig.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+			Token:     refreshToken,
+			UserID:    user.ID,
+			ExpiresAt: time.Now().Add(time.Hour * 24 * 60),
+		})
+		if err != nil {
+			log.Printf("Error creating refresh token: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		dat, err := json.Marshal(userResponse{
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt.Time,
+			UpdatedAt:    user.UpdatedAt.Time,
+			Email:        user.Email,
+			Token:        token,
+			RefreshToken: refreshToken,
+			IsChirpyRed:  user.IsChirpyRed.Bool,
+		})
+		if err != nil {
+			log.Printf("Error marshalling JSON: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+		w.Write(dat)
+	}
+
+	refreshHandler := func(w http.ResponseWriter, r *http.Request) {
+		refreshToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error getting bearer token: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		token, err := apiConfig.db.GetRefreshToken(r.Context(), refreshToken)
+		if err != nil {
+			log.Printf("Error getting refresh token: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		// Check if token is revoked (RevokedAt is set)
+		if token.RevokedAt.Valid {
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		// Check if token has expired
+		if token.ExpiresAt.Before(time.Now().UTC()) {
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		userID, err := apiConfig.db.GetUserFromRefreshToken(r.Context(), token.Token)
+		if err != nil {
+			log.Printf("Error getting user: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		newToken, err := auth.MakeJWT(userID, apiConfig.tokenSecret, time.Hour)
 		if err != nil {
 			log.Printf("Error creating JWT: %s", err)
 			w.WriteHeader(500)
@@ -360,12 +478,8 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		dat, err := json.Marshal(userResponse{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt.Time,
-			UpdatedAt: user.UpdatedAt.Time,
-			Email:     user.Email,
-			Token:     token,
+		dat, err := json.Marshal(refreshResponse{
+			Token: newToken,
 		})
 		if err != nil {
 			log.Printf("Error marshalling JSON: %s", err)
@@ -373,6 +487,200 @@ func main() {
 			return
 		}
 		w.Write(dat)
+	}
+
+	revokeHandler := func(w http.ResponseWriter, r *http.Request) {
+		refreshToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error getting bearer token: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		err = apiConfig.db.RevokeRefreshToken(r.Context(), refreshToken)
+		if err != nil {
+			log.Printf("Error revoking refresh token: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		w.WriteHeader(204)
+	}
+
+	updateUserHandler := func(w http.ResponseWriter, r *http.Request) {
+		decoder := json.NewDecoder(r.Body)
+		params := userRequest{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			log.Printf("Error decoding parameters: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error getting bearer token: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		userID, err := auth.ValidateJWT(token, apiConfig.tokenSecret)
+		if err != nil {
+			log.Printf("Error validating JWT: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(params.Password), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("Error hashing password: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		err = apiConfig.db.UpdateUser(r.Context(), database.UpdateUserParams{
+			ID:             userID,
+			Email:          params.Email,
+			HashedPassword: string(hashedPassword),
+		})
+
+		if err != nil {
+			log.Printf("Error updating user: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		user, err := apiConfig.db.GetUserByEmail(r.Context(), params.Email)
+		if err != nil {
+			log.Printf("Error getting user: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		userResponse := userResponse{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt.Time,
+			UpdatedAt: user.UpdatedAt.Time,
+			Email:     user.Email,
+		}
+
+		w.WriteHeader(200)
+		dat, err := json.Marshal(userResponse)
+		if err != nil {
+			log.Printf("Error marshalling JSON: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+		w.Write(dat)
+	}
+
+	deleteChirpHandler := func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error getting bearer token: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		userID, err := auth.ValidateJWT(token, apiConfig.tokenSecret)
+		if err != nil {
+			log.Printf("Error validating JWT: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		chirpID := r.PathValue("id")
+		chirpIDUUID, err := uuid.Parse(chirpID)
+		if err != nil {
+			log.Printf("Error parsing chirp ID: %s", err)
+			w.WriteHeader(400)
+			w.Write([]byte("Invalid chirp ID"))
+			return
+		}
+
+		chirp, err := apiConfig.db.GetChirp(r.Context(), chirpIDUUID)
+		if err != nil {
+			log.Printf("Error getting chirp: %s", err)
+			w.WriteHeader(404)
+			w.Write([]byte("Chirp not found"))
+			return
+		}
+
+		if chirp.UserID != userID {
+			w.WriteHeader(403)
+			w.Write([]byte("Forbidden"))
+			return
+		}
+
+		err = apiConfig.db.DeleteChirp(r.Context(), chirpIDUUID)
+		if err != nil {
+			log.Printf("Error deleting chirp: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		w.WriteHeader(204)
+	}
+
+	polkaWebhookHandler := func(w http.ResponseWriter, r *http.Request) {
+		apiKey, err := auth.GetAPIKey(r.Header)
+		if err != nil {
+			log.Printf("Error getting API key: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		if apiKey != apiConfig.polkaKey {
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := polkaWebhookRequest{}
+		err = decoder.Decode(&params)
+		if err != nil {
+			log.Printf("Error decoding parameters: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		if params.Event != "user.upgraded" {
+			w.WriteHeader(204)
+			return
+		}
+
+		err = apiConfig.db.SetIsChirpyRed(r.Context(), database.SetIsChirpyRedParams{
+			ID:          params.Data.UserID,
+			IsChirpyRed: sql.NullBool{Bool: true, Valid: true},
+		})
+		if err != nil {
+			switch err {
+			case sql.ErrNoRows:
+				w.WriteHeader(404)
+				w.Write([]byte("User not found"))
+				return
+			default:
+				w.WriteHeader(500)
+				w.Write([]byte("Something went wrong"))
+				return
+			}
+		}
+
+		w.WriteHeader(204)
 	}
 
 	mux := http.NewServeMux()
@@ -384,10 +692,14 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", postChirpHandler)
 	mux.HandleFunc("GET /api/chirps", getChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{id}", getChirpHandler)
+	mux.HandleFunc("DELETE /api/chirps/{id}", deleteChirpHandler)
 
 	mux.HandleFunc("POST /api/users", postUserHandler)
+	mux.HandleFunc("PUT /api/users", updateUserHandler)
 	mux.HandleFunc("POST /api/login", loginHandler)
-
+	mux.HandleFunc("POST /api/refresh", refreshHandler)
+	mux.HandleFunc("POST /api/revoke", revokeHandler)
+	mux.HandleFunc("POST /api/polka/webhooks", polkaWebhookHandler)
 	server := http.Server{
 		Handler: mux,
 		Addr:    ":8080",

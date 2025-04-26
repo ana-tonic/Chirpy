@@ -1,0 +1,9 @@
+Run a migration: 
+1. Go to: sql/schema
+2. Run: goose postgres postgres://postgres:postgres@localhost:5432/chirpy up
+-----------------------------
+Generate Code from sql query:
+sqlc generate
+-----------------------------
+Build and run server:
+go build -o out && ./out
