@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ana-tonic/Chirpy/internal/auth"
 	"github.com/ana-tonic/Chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -22,6 +23,8 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	tokenSecret    string
+	platform       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -36,11 +39,18 @@ type userRequest struct {
 	Password string `json:"password"`
 }
 
+type loginRequest struct {
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	ExpiresInSeconds int    `json:"expires_in_seconds"`
+}
+
 type userResponse struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 type chirpRequest struct {
@@ -68,10 +78,14 @@ func main() {
 	defer db.Close()
 
 	dbQueries := database.New(db)
-
 	apiConfig.db = dbQueries
 
 	platform := os.Getenv("PLATFORM")
+	apiConfig.platform = platform
+
+	tokenSecret := os.Getenv("TOKEN_SECRET")
+	apiConfig.tokenSecret = tokenSecret
+	log.Printf("Token secret loaded: %q", tokenSecret)
 
 	h1 := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -98,7 +112,7 @@ func main() {
 	h3 := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 
-		if platform != "dev" {
+		if apiConfig.platform != "dev" {
 			w.WriteHeader(403)
 			return
 		}
@@ -114,7 +128,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	h5 := func(w http.ResponseWriter, r *http.Request) {
+	postUserHandler := func(w http.ResponseWriter, r *http.Request) {
 		decoder := json.NewDecoder(r.Body)
 		params := userRequest{}
 		err := decoder.Decode(&params)
@@ -163,10 +177,27 @@ func main() {
 		w.Write(dat)
 	}
 
-	h6 := func(w http.ResponseWriter, r *http.Request) {
+	postChirpHandler := func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("Request headers: %v", r.Header)
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error getting bearer token: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		userID, err := auth.ValidateJWT(token, apiConfig.tokenSecret)
+		if err != nil {
+			log.Printf("Error validating JWT: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
 		decoder := json.NewDecoder(r.Body)
 		params := chirpRequest{}
-		err := decoder.Decode(&params)
+		err = decoder.Decode(&params)
 		if err != nil {
 			log.Printf("Error decoding parameters: %s", err)
 			w.WriteHeader(500)
@@ -188,7 +219,7 @@ func main() {
 
 		chirp, err := apiConfig.db.CreateChirp(r.Context(), database.CreateChirpParams{
 			Body:   params.Body,
-			UserID: params.UserID,
+			UserID: userID,
 		})
 		if err != nil {
 			log.Printf("Error creating chirp: %s", err)
@@ -216,7 +247,7 @@ func main() {
 		w.Write(dat)
 	}
 
-	h7 := func(w http.ResponseWriter, r *http.Request) {
+	getChirpsHandler := func(w http.ResponseWriter, r *http.Request) {
 		chirps, err := apiConfig.db.GetChirps(r.Context())
 		if err != nil {
 			log.Printf("Error getting chirps: %s", err)
@@ -247,7 +278,7 @@ func main() {
 		w.Write(dat)
 	}
 
-	h8 := func(w http.ResponseWriter, r *http.Request) {
+	getChirpHandler := func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		chirp, err := apiConfig.db.GetChirp(r.Context(), uuid.MustParse(id))
 		if err != nil {
@@ -283,17 +314,79 @@ func main() {
 		w.Write(dat)
 	}
 
+	loginHandler := func(w http.ResponseWriter, r *http.Request) {
+		decoder := json.NewDecoder(r.Body)
+		params := loginRequest{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			log.Printf("Error decoding parameters: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return
+		}
+
+		user, err := apiConfig.db.GetUserByEmail(r.Context(), params.Email)
+		if err != nil {
+			log.Printf("Error getting user: %s", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		err = bcrypt.CompareHashAndPassword([]byte(user.HashedPassword), []byte(params.Password))
+		if err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		// Default expiration time is 1 hour
+		expiresIn := time.Hour
+
+		// If client specified expiration time, use it (but cap at 1 hour)
+		if params.ExpiresInSeconds > 0 {
+			clientExpiration := time.Duration(params.ExpiresInSeconds) * time.Second
+			if clientExpiration < expiresIn {
+				expiresIn = clientExpiration
+			}
+		}
+
+		token, err := auth.MakeJWT(user.ID, apiConfig.tokenSecret, expiresIn)
+		if err != nil {
+			log.Printf("Error creating JWT: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		dat, err := json.Marshal(userResponse{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt.Time,
+			UpdatedAt: user.UpdatedAt.Time,
+			Email:     user.Email,
+			Token:     token,
+		})
+		if err != nil {
+			log.Printf("Error marshalling JSON: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+		w.Write(dat)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/healthz", h1)
 	mux.HandleFunc("GET /admin/metrics", h2)
 	mux.HandleFunc("POST /admin/reset", h3)
 	mux.Handle("/app/", apiConfig.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 
-	mux.HandleFunc("POST /api/chirps", h6)
-	mux.HandleFunc("GET /api/chirps", h7)
-	mux.HandleFunc("GET /api/chirps/{id}", h8)
+	mux.HandleFunc("POST /api/chirps", postChirpHandler)
+	mux.HandleFunc("GET /api/chirps", getChirpsHandler)
+	mux.HandleFunc("GET /api/chirps/{id}", getChirpHandler)
 
-	mux.HandleFunc("POST /api/users", h5)
+	mux.HandleFunc("POST /api/users", postUserHandler)
+	mux.HandleFunc("POST /api/login", loginHandler)
 
 	server := http.Server{
 		Handler: mux,
